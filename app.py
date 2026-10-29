@@ -25,7 +25,8 @@ from contextlib import closing
 from datetime import datetime, timedelta
 from datetime import time as dtime
 from html import escape
-
+from streamlit_webrtc import webrtc_streamer
+import av
 import cv2
 import numpy as np
 import pandas as pd
@@ -821,32 +822,50 @@ with tab_live:
         )
 
         # ============================ MODE 1: LIVE WEBCAM ============================
+        # ============================ MODE 1: LIVE WEBCAM (CLOUD-READY) ============================
         if mode.startswith("🔴"):
-            c1, c2, c3, c4 = st.columns(4)
-            cam_index = c1.number_input("Camera index", 0, 5, 0, help="0 = default webcam")
-            confirm_frames = c2.slider("Confirm in N scans", 1, 5, 2,
-                                       help="A student must be recognised in N analysed frames in a row before being marked.")
-            process_every = c3.slider("Analyse every N frames", 1, 10, 5,
-                                      help="Higher = smoother video but slower reaction.")
-            max_seconds = c4.slider("Auto-stop (seconds)", 15, 600, 120, 15)
-            st.caption(
-                "ℹ️ Live mode reads the webcam of the machine running Streamlit (run the app locally). "
-                "On cloud hosting use **Upload video** or **Class photo** instead."
-            )
+            st.info("Live cloud scanner activated. Please allow camera permissions in your browser.")
+            
+            with st.spinner("Loading registered faces..."):
+                known = load_known(live_students)
 
-            b1, b2, _ = st.columns([1, 1, 4])
-            start = b1.button("▶️ Start live scan")
-            b2.button("⏹ Stop")   # clicking triggers a rerun, which ends the running loop
+            if not known:
+                st.error("No usable registered face photos were found.")
+            else:
+                # The callback that processes the video feed in real-time
+                def process_frame(frame: av.VideoFrame) -> av.VideoFrame:
+                    # Convert browser frame to OpenCV format
+                    img = frame.to_ndarray(format="bgr24")
+                    img = resize_max(img, 800)
+                    
+                    # Run DeepFace recognition
+                    results = recognize_frame(img, known)
+                    
+                    marked_ids = set()
+                    for r in results:
+                        stu = r["student"]
+                        if stu is not None:
+                            sid = str(stu["ID"])
+                            # Mark them present in the database if not already marked
+                            if not already_marked(sid, datetime.now().strftime("%Y-%m-%d")):
+                                mark_present(stu, img, datetime.now(), r["box"])
+                            marked_ids.add(sid)
+                            
+                    # Draw boxes and names on the video feed
+                    annotated_img = annotate_frame(img, results, marked_ids)
+                    
+                    # Return the processed frame to the browser
+                    return av.VideoFrame.from_ndarray(annotated_img, format="bgr24")
 
-            vcol, lcol = st.columns([3, 2], gap="large")
-            with vcol:
-                video_slot = st.empty()
-                status_slot = st.empty()
-            with lcol:
-                st.markdown("##### ✅ Marked this session")
-                log_slot = st.empty()
-                render_live_session_log(log_slot, [])
-
+                # Start the cloud-compatible video stream
+                webrtc_streamer(
+                    key="cloud_live_attendance",
+                    video_frame_callback=process_frame,
+                    media_stream_constraints={"video": True, "audio": False},
+                    rtc_configuration={
+                        "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+                    }
+                )
             if start:
                 with st.spinner("Loading registered faces (first run can take a moment)..."):
                     known = load_known(live_students)
