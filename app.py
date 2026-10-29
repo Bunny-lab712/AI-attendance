@@ -1,10 +1,10 @@
 """
-AI Facial Recognition Attendance System  —  Pro Edition
---------------------------------------------------------
-Stack : Streamlit + DeepFace (Facenet) + OpenCV + SQLite + Pandas
+AI Facial Recognition Attendance System  -  Pro Edition (fixed)
+----------------------------------------------------------------
+Stack : Streamlit + DeepFace (Facenet) + OpenCV + SQLite + Pandas + streamlit-webrtc
 
 Install:
-    pip install "streamlit>=1.50" deepface tf-keras opencv-python pandas numpy openpyxl
+    pip install "streamlit>=1.50" deepface tf-keras opencv-python pandas numpy openpyxl streamlit-webrtc av
 
 Run:
     streamlit run app.py
@@ -20,18 +20,20 @@ import os
 import re
 import sqlite3
 import tempfile
+import threading
 import time
 from contextlib import closing
 from datetime import datetime, timedelta
 from datetime import time as dtime
 from html import escape
-from streamlit_webrtc import webrtc_streamer
+
 import av
 import cv2
 import numpy as np
 import pandas as pd
 import streamlit as st
 from deepface import DeepFace
+from streamlit_webrtc import webrtc_streamer
 
 # =============================================================================
 # 0. CONFIGURATION
@@ -49,6 +51,8 @@ MATCH_THRESHOLD = 0.40   # DeepFace's default cosine threshold for Facenet
 DETECTOR = "opencv"
 
 MIN_FACE_PX = 40         # ignore tiny/false face detections smaller than this (pixels)
+LIVE_INTERVAL = 0.8      # seconds between AI analyses in the live webcam mode
+LIVE_CONFIRM = 2         # consecutive sightings needed before marking present (live mode)
 
 STATUS_COLORS = {"Present": "#10b981", "Late": "#f59e0b", "Excused": "#3b82f6"}
 
@@ -264,7 +268,7 @@ st.markdown(f"<style>{CSS}</style>", unsafe_allow_html=True)
 # 2. DATABASE LAYER
 # =============================================================================
 def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=10)
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
@@ -470,11 +474,14 @@ def load_known(students: pd.DataFrame) -> list:
     return known
 
 
-def recognize_frame(frame: np.ndarray, known: list) -> list:
-    """Find every face in a frame and match each against the known students."""
+def recognize_frame(frame: np.ndarray, known: list, threshold: float = None, detector: str = None) -> list:
+    """Find every face in a frame and match each against the known students.
+    threshold/detector are passed explicitly so this is safe to call from a background thread."""
+    threshold = MATCH_THRESHOLD if threshold is None else threshold
+    detector = DETECTOR if detector is None else detector
     try:
         faces = DeepFace.represent(
-            img_path=frame, model_name=MODEL_NAME, detector_backend=DETECTOR, enforce_detection=True
+            img_path=frame, model_name=MODEL_NAME, detector_backend=detector, enforce_detection=True
         )
     except ValueError:
         return []   # no face in this frame
@@ -489,7 +496,7 @@ def recognize_frame(frame: np.ndarray, known: list) -> list:
             d = cosine_distance(f["embedding"], emb)
             if best_d is None or d < best_d:
                 best, best_d = stu, d
-        matched = best is not None and best_d <= MATCH_THRESHOLD
+        matched = best is not None and best_d <= threshold
         results.append({"box": box, "student": best if matched else None, "distance": best_d})
     return results
 
@@ -515,9 +522,11 @@ def annotate_frame(frame: np.ndarray, results: list, marked_ids: set) -> np.ndar
     return out
 
 
-def mark_present(student: dict, img: np.ndarray, now: datetime, face_box=None):
+def mark_present(student: dict, img: np.ndarray, now: datetime, face_box=None,
+                 late_on: bool = False, late_after=None):
     """
     Mark a recognised student present (saves a cropped face snapshot for auditing).
+    late_on / late_after are passed in explicitly (thread-safe).
     Returns ("marked", status) or ("already", None).
     """
     sid = str(student["ID"])
@@ -534,7 +543,7 @@ def mark_present(student: dict, img: np.ndarray, now: datetime, face_box=None):
         if crop.size:
             snap = crop
 
-    status = "Late" if (late_on and now.time() > late_after) else "Present"
+    status = "Late" if (late_on and late_after is not None and now.time() > late_after) else "Present"
     path = save_capture(snap, sid, now)
     try:
         insert_attendance(sid, date_str, now.strftime("%H:%M:%S"), path, status)
@@ -586,6 +595,10 @@ def section(title: str, subtitle: str = "") -> None:
 def badge(status: str) -> str:
     cls = {"Present": "b-present", "Late": "b-late", "Excused": "b-excused"}.get(status, "b-present")
     return f'<span class="badge {cls}">{escape(str(status))}</span>'
+
+
+def display_name(name, fallback) -> str:
+    return str(name) if pd.notna(name) and str(name).strip() else str(fallback)
 
 
 def hero_html(stats: dict) -> str:
@@ -649,35 +662,14 @@ def feed_html(df: pd.DataFrame) -> str:
     items = []
     for r in df.itertuples():
         src = thumb(r.Profile_Pic_Path, 96)
-        name = r.Name if r.Name else r.Student_ID
-        avatar = f'<img src="{src}"/>' if src else f'<div class="avatar">{escape(str(name)[:1].upper())}</div>'
+        name = display_name(r.Name, r.Student_ID)
+        avatar = f'<img src="{src}"/>' if src else f'<div class="avatar">{escape(name[:1].upper())}</div>'
         items.append(
-            f'<div class="feed-item">{avatar}<div><div class="feed-name">{escape(str(name))}</div>'
+            f'<div class="feed-item">{avatar}<div><div class="feed-name">{escape(name)}</div>'
             f'<div class="feed-time">🕒 {escape(str(r.Time))}</div></div>'
             f'<div class="feed-right">{badge(r.Status)}</div></div>'
         )
     return "".join(items)
-
-
-def render_live_session_log(slot, entries: list) -> None:
-    with slot.container():
-        if not entries:
-            st.markdown('<div class="empty">Waiting for faces…</div>', unsafe_allow_html=True)
-            return
-
-        for entry in entries:
-            image_col, details_col = st.columns([1, 4], vertical_alignment="center")
-            profile_path = entry["Profile_Pic_Path"]
-            if profile_path and os.path.isfile(profile_path):
-                image_col.image(profile_path, width=64)
-            else:
-                image_col.caption("No profile photo")
-
-            details_col.markdown(
-                f"**{escape(str(entry['Name']))}**  \n"
-                f"🕒 {escape(str(entry['Time']))} · {badge(entry['Status'])}",
-                unsafe_allow_html=True,
-            )
 
 
 def gallery_html(items: list) -> str:
@@ -821,115 +813,98 @@ with tab_live:
             horizontal=True, label_visibility="collapsed", key="live_mode",
         )
 
-        # ============================ MODE 1: LIVE WEBCAM ============================
-        # ============================ MODE 1: LIVE WEBCAM (CLOUD-READY) ============================
+        # ============================ MODE 1: LIVE WEBCAM (WebRTC) ============================
         if mode.startswith("🔴"):
-            st.info("Live cloud scanner activated. Please allow camera permissions in your browser.")
-            
+            st.info("Allow camera permission in your browser, then press START. "
+                    "Faces are analysed about once per second; a student is marked after "
+                    f"{LIVE_CONFIRM} consecutive sightings.")
+
             with st.spinner("Loading registered faces..."):
                 known = load_known(live_students)
 
             if not known:
                 st.error("No usable registered face photos were found.")
             else:
-                # The callback that processes the video feed in real-time
-                def process_frame(frame: av.VideoFrame) -> av.VideoFrame:
-                    # Convert browser frame to OpenCV format
-                    img = frame.to_ndarray(format="bgr24")
-                    img = resize_max(img, 800)
-                    
-                    # Run DeepFace recognition
-                    results = recognize_frame(img, known)
-                    
-                    marked_ids = set()
-                    for r in results:
-                        stu = r["student"]
-                        if stu is not None:
-                            sid = str(stu["ID"])
-                            # Mark them present in the database if not already marked
-                            if not already_marked(sid, datetime.now().strftime("%Y-%m-%d")):
-                                mark_present(stu, img, datetime.now(), r["box"])
-                            marked_ids.add(sid)
-                            
-                    # Draw boxes and names on the video feed
-                    annotated_img = annotate_frame(img, results, marked_ids)
-                    
-                    # Return the processed frame to the browser
-                    return av.VideoFrame.from_ndarray(annotated_img, format="bgr24")
+                # Shared state lives in session_state so the callback thread can use it safely.
+                if "live_state" not in st.session_state:
+                    st.session_state["live_state"] = {
+                        "lock": threading.Lock(), "results": [], "last_t": 0.0,
+                        "counts": {}, "marked": set(),
+                    }
+                live_state = st.session_state["live_state"]
 
-                # Start the cloud-compatible video stream
+                # Capture current settings as plain values (no st.* / globals needed in the thread)
+                cfg_threshold, cfg_detector = float(MATCH_THRESHOLD), str(DETECTOR)
+                cfg_late_on, cfg_late_after = bool(late_on), late_after
+
+                def process_frame(frame: av.VideoFrame) -> av.VideoFrame:
+                    img = resize_max(frame.to_ndarray(format="bgr24"), 800)
+                    now_t = time.time()
+
+                    with live_state["lock"]:
+                        due = (now_t - live_state["last_t"]) >= LIVE_INTERVAL
+                        if due:
+                            live_state["last_t"] = now_t
+
+                    if due:
+                        try:
+                            results = recognize_frame(img, known, cfg_threshold, cfg_detector)
+                        except Exception:
+                            results = []
+
+                        seen = set()
+                        for r in results:
+                            stu = r["student"]
+                            if stu is None:
+                                continue
+                            sid = str(stu["ID"])
+                            seen.add(sid)
+                            if sid in live_state["marked"]:
+                                continue
+                            live_state["counts"][sid] = live_state["counts"].get(sid, 0) + 1
+                            if live_state["counts"][sid] >= LIVE_CONFIRM:
+                                try:
+                                    mark_present(stu, img, datetime.now(), r["box"],
+                                                 cfg_late_on, cfg_late_after)
+                                except Exception:
+                                    pass
+                                live_state["marked"].add(sid)
+                        for sid in list(live_state["counts"]):   # require *consecutive* sightings
+                            if sid not in seen:
+                                live_state["counts"][sid] = 0
+
+                        with live_state["lock"]:
+                            live_state["results"] = results
+
+                    with live_state["lock"]:
+                        results = list(live_state["results"])
+                        marked = set(live_state["marked"])
+
+                    return av.VideoFrame.from_ndarray(annotate_frame(img, results, marked), format="bgr24")
+
                 webrtc_streamer(
                     key="cloud_live_attendance",
                     video_frame_callback=process_frame,
                     media_stream_constraints={"video": True, "audio": False},
-                    rtc_configuration={
-                        "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
-                    }
+                    rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+                    async_processing=True,
                 )
-            if start:
-                with st.spinner("Loading registered faces (first run can take a moment)..."):
-                    known = load_known(live_students)
 
-                if not known:
-                    st.error("No usable registered face photos were found.")
+                st.markdown("##### ✅ Checked in today")
+                if st.button("🔄 Refresh list", key="live_refresh"):
+                    pass  # a button click triggers a rerun, which reloads the table below
+                today_df = query_df(
+                    """
+                    SELECT a.Time, s.Name, a.Student_ID, a.Status
+                    FROM Attendance a LEFT JOIN Students s ON s.ID = a.Student_ID
+                    WHERE a.Date = ? ORDER BY a.Time DESC
+                    """,
+                    (datetime.now().strftime("%Y-%m-%d"),),
+                )
+                if today_df.empty:
+                    st.markdown('<div class="empty">Waiting for faces…</div>', unsafe_allow_html=True)
                 else:
-                    cap = cv2.VideoCapture(int(cam_index))
-                    if not cap.isOpened():
-                        st.error("Could not open the camera. Check the camera index/permissions or close other apps using it.")
-                    else:
-                        marked_ids, counts, session_log = set(), {}, []
-                        last_results, frame_no, t0 = [], 0, time.time()
-                        try:
-                            while time.time() - t0 < max_seconds:
-                                ok, frame = cap.read()
-                                if not ok:
-                                    st.error("The camera stream ended unexpectedly.")
-                                    break
-                                frame = resize_max(frame, 800)
-                                frame_no += 1
-
-                                if (frame_no - 1) % process_every == 0:
-                                    last_results = recognize_frame(frame, known)
-                                    seen = set()
-                                    for r in last_results:
-                                        stu = r["student"]
-                                        if stu is None:
-                                            continue
-                                        sid = str(stu["ID"])
-                                        seen.add(sid)
-                                        if sid in marked_ids:
-                                            continue
-                                        counts[sid] = counts.get(sid, 0) + 1
-                                        if counts[sid] >= confirm_frames:
-                                            now = datetime.now()
-                                            state, status = mark_present(stu, frame, now, r["box"])
-                                            marked_ids.add(sid)
-                                            if state == "marked":
-                                                session_log.insert(0, {
-                                                    "Time": now.strftime("%H:%M:%S"), "Status": status,
-                                                    "Student_ID": sid, "Name": stu["Name"],
-                                                    "Profile_Pic_Path": stu["Profile_Pic_Path"],
-                                                })
-                                                render_live_session_log(log_slot, session_log)
-                                                st.toast(f"{stu['Name']} checked in ({status})", icon="✅")
-                                    for sid in list(counts):      # require *consecutive* sightings
-                                        if sid not in seen:
-                                            counts[sid] = 0
-
-                                    left = int(max(max_seconds - (time.time() - t0), 0))
-                                    status_slot.markdown(
-                                        '<div class="live-status"><span class="live-pill"><span class="live-dot"></span>LIVE</span>'
-                                        f' &nbsp; Faces in view: <b>{len(last_results)}</b> · '
-                                        f'Marked this session: <b>{len(session_log)}</b> · Time left: <b>{left}s</b></div>',
-                                        unsafe_allow_html=True,
-                                    )
-
-                                video_slot.image(
-                                    annotate_frame(frame, last_results, marked_ids), channels="BGR", width=800
-                                )
-                        finally:
-                            cap.release()
-                        st.success(f"✅ Live session finished — {len(session_log)} new student(s) marked.")
+                    st.dataframe(today_df, width="stretch", hide_index=True)
 
         # ============================ MODE 2: UPLOAD VIDEO ============================
         elif mode.startswith("🎞️"):
@@ -984,7 +959,8 @@ with tab_live:
                                                 continue
                                             counts[sid] = counts.get(sid, 0) + 1
                                             if counts[sid] >= confirm_v:
-                                                state, status = mark_present(stu, frame, datetime.now(), r["box"])
+                                                state, status = mark_present(
+                                                    stu, frame, datetime.now(), r["box"], late_on, late_after)
                                                 found[sid] = {
                                                     "Student_ID": sid, "Name": stu["Name"], "First seen": stamp,
                                                     "Result": f"✅ Marked ({status})" if state == "marked"
@@ -1054,7 +1030,7 @@ with tab_live:
 
                         rows, now, marked_ids = [], datetime.now(), set()
                         for sid, r in best_per.items():
-                            state, status = mark_present(r["student"], img, now, r["box"])
+                            state, status = mark_present(r["student"], img, now, r["box"], late_on, late_after)
                             marked_ids.add(sid)
                             rows.append({
                                 "Student_ID": sid, "Name": r["student"]["Name"],
@@ -1244,12 +1220,12 @@ with tab_admin:
                 st.info("No attendance records for this selection.")
             else:
                 options = {
-                    f"{r.Name or r.Student_ID} — {r.Date} {r.Time} ({r.Status})": r.Capture_Pic_Path
+                    f"{display_name(r.Name, r.Student_ID)} — {r.Date} {r.Time} ({r.Status})": r.Capture_Pic_Path
                     for r in df_att.itertuples()
                 }
                 choice = st.selectbox("Select a record", list(options.keys()))
                 pic = options[choice]
-                if pic and os.path.exists(pic):
+                if isinstance(pic, str) and pic and os.path.exists(pic):
                     st.image(pic, caption=pic, width=340)
                 else:
                     st.info("No capture photo for this record (it may have been entered manually).")
@@ -1296,7 +1272,7 @@ with tab_admin:
             else:
                 st.markdown(
                     gallery_html([
-                        (r.Capture_Pic_Path, r.Name or r.Student_ID, f"{r.Date} · {r.Time}")
+                        (r.Capture_Pic_Path, display_name(r.Name, r.Student_ID), f"{r.Date} · {r.Time}")
                         for r in gal_df.head(40).itertuples()
                     ]),
                     unsafe_allow_html=True,
@@ -1356,7 +1332,9 @@ with tab_analytics:
     cols = [c for c in STATUS_COLORS if c in pivot.columns] + [c for c in pivot.columns if c not in STATUS_COLORS]
     pivot = pivot[cols]
     pivot.index.name = "Date"
-    total_trend = (pivot.get("Present", 0) + pivot.get("Late", 0)).rename("Students Present")
+    # reindex guarantees a Series even when "Present"/"Late" columns are missing
+    _pl = pivot.reindex(columns=["Present", "Late"], fill_value=0)
+    total_trend = (_pl["Present"] + _pl["Late"]).rename("Students Present")
 
     k1, k2, k3 = st.columns(3)
     k1.metric("Check-ins in range", int(pivot.values.sum()))
