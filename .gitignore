@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+registered_faces/
+daily_captures/
+attendance.db
+.env
